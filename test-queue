@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""A machine-wide FIFO for development checks (macOS/Linux, Python 3.9+)."""
+import argparse
+import contextlib
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+
+def state_dir():
+    path = Path(os.environ.get('TEST_QUEUE_STATE_DIR', '~/.local/state/test-queue')).expanduser()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return path
+
+
+@contextlib.contextmanager
+def guard(root):
+    with (root / 'guard.lock').open('a') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def live_jobs(root):
+    jobs = []
+    for path in sorted(root.glob('job-*.json')):
+        try:
+            with path.open('r+') as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    jobs.append(json.load(handle))
+                else:
+                    path.unlink()
+        except FileNotFoundError:
+            pass
+    return jobs
+
+
+def write_job(handle, job):
+    handle.seek(0)
+    json.dump(job, handle)
+    handle.truncate()
+    handle.flush()
+
+
+def memory_pressure():
+    """Return macOS warning/critical pressure; unavailable telemetry fails open."""
+    if sys.platform != 'darwin':
+        return None
+    try:
+        result = subprocess.run(['/usr/sbin/sysctl', '-n',
+                                 'kern.memorystatus_vm_pressure_level'],
+                                capture_output=True, text=True, timeout=2, check=True)
+        level = int(result.stdout.strip())
+        return level if level in (1, 2, 4) else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def run(command):
+    memory_wait_limit = float(os.environ.get("TEST_QUEUE_MEMORY_WAIT_SECONDS", "30"))
+    if not math.isfinite(memory_wait_limit) or memory_wait_limit < 0:
+        raise ValueError("TEST_QUEUE_MEMORY_WAIT_SECONDS must be a finite nonnegative number")
+    root = state_dir()
+    identifier = f'{time.time_ns():020d}-{uuid.uuid4().hex}'
+    path = root / f'job-{identifier}.json'
+    job = dict(id=identifier, pid=os.getpid(), cwd=os.getcwd(), command=command,
+               queued=time.time(), state='waiting')
+    child = None
+    interrupted = None
+
+    def forward(signum, frame):
+        nonlocal interrupted
+        interrupted = signum
+        if child is not None:
+            try:
+                os.killpg(child.pid, signum)
+            except ProcessLookupError:
+                pass
+
+    old_handlers = {s: signal.signal(s, forward) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    result = 1
+    next_memory_probe = 0.0
+    pressure = None
+    pressure_reported = False
+    head_since = None
+    try:
+        with guard(root):
+            ticket = path.open('x+')
+            fcntl.flock(ticket, fcntl.LOCK_EX)
+            write_job(ticket, job)
+        with ticket:
+            print(f'[test-queue] queued {identifier}; cwd={job["cwd"]}', file=sys.stderr)
+            while interrupted is None:
+                with guard(root):
+                    jobs = live_jobs(root)
+                    if jobs and jobs[0]['id'] == identifier:
+                        now = time.monotonic()
+                        if head_since is None:
+                            head_since = now
+                        if now >= next_memory_probe:
+                            pressure = memory_pressure()
+                            next_memory_probe = time.monotonic() + 2
+                        if pressure in (2, 4) and now - head_since < memory_wait_limit:
+                            job.update(state='waiting-memory', memory_pressure=pressure)
+                            write_job(ticket, job)
+                            if not pressure_reported:
+                                print(f'[test-queue] memory pressure elevated; pausing up to {memory_wait_limit:g}s; '
+                                      'Ctrl-C cancels this job', file=sys.stderr)
+                                pressure_reported = True
+                        else:
+                            if pressure in (2, 4):
+                                job['memory_wait_limit_reached'] = True
+                                print('[test-queue] memory pause limit reached; starting one '
+                                      'low-priority job', file=sys.stderr)
+                            if pressure is None and sys.platform == 'darwin':
+                                print('[test-queue] memory-pressure telemetry unavailable; '
+                                      'continuing with serialization only', file=sys.stderr)
+                            job.update(state='running', started=time.time(), nice_increment=10)
+                            write_job(ticket, job)
+                            break
+                time.sleep(0.2)
+            if interrupted is not None:
+                result = 128 + interrupted
+            else:
+                print(f'[test-queue] running after {time.time()-job["queued"]:.1f}s', file=sys.stderr)
+                try:
+                    child = subprocess.Popen(['/usr/bin/nice', '-n', '10', *command],
+                                             start_new_session=True, pass_fds=(ticket.fileno(),))
+                    job['child_pid'] = child.pid
+                    with guard(root):
+                        write_job(ticket, job)
+                    if interrupted is not None:
+                        forward(interrupted, None)
+                    _, status, usage = os.wait4(child.pid, 0)
+                    code = os.waitstatus_to_exitcode(status)
+                    child.returncode = code
+                    job.update(cpu_user_seconds=usage.ru_utime,
+                               cpu_system_seconds=usage.ru_stime,
+                               peak_process_rss_bytes=int(usage.ru_maxrss *
+                                                         (1 if sys.platform == 'darwin' else 1024)))
+                    result = code if code >= 0 else 128 - code
+                except OSError as error:
+                    print(f'[test-queue] {error}', file=sys.stderr)
+                    result = 127
+            job.update(finished=time.time(), exit_code=result, state='finished')
+            job['wait_seconds'] = job.get('started', job['finished']) - job['queued']
+            job['run_seconds'] = job['finished'] - job.get('started', job['finished'])
+            with guard(root):
+                with (root / 'history.jsonl').open('a') as history:
+                    history.write(json.dumps(job) + '\n')
+                path.unlink(missing_ok=True)
+    finally:
+        # Keep the slot until the child exits, including during unexpected errors.
+        if child is not None and child.poll() is None:
+            forward(signal.SIGTERM, None)
+            child.wait()
+        with guard(root):
+            path.unlink(missing_ok=True)
+        for s, handler in old_handlers.items():
+            signal.signal(s, handler)
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='action', required=True)
+    for name in ('run', 'test'):
+        p = sub.add_parser(name, help='queue a command' if name == 'run' else 'queue npm test with two Vitest workers')
+        p.add_argument('command', nargs=argparse.REMAINDER)
+    sub.add_parser('status', help='show running and waiting commands as JSON')
+    sub.add_parser('history', help='show the last 20 completed jobs as JSON lines')
+    args = parser.parse_args()
+    if args.action == 'status':
+        root = state_dir()
+        with guard(root):
+            print(json.dumps(live_jobs(root), indent=2))
+        return 0
+    if args.action == 'history':
+        path = state_dir() / 'history.jsonl'
+        if path.exists():
+            print(''.join(path.read_text().splitlines(keepends=True)[-20:]), end='')
+        return 0
+    command = args.command
+    if command[:1] == ['--']:
+        command = command[1:]
+    if args.action == 'test':
+        if any(x.startswith('--maxWorkers') or x.startswith('--max-workers') for x in command):
+            parser.error('test fixes maxWorkers at 2; use run for a different limit')
+        command = ['npm', 'test', '--', *command, '--maxWorkers=2']
+    if not command:
+        parser.error('run requires a command after --')
+    return run(command)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
